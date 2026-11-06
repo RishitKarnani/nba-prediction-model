@@ -50,9 +50,18 @@ data/processed/*
 data/external/*
 !data/external/.gitkeep
 
-# Keep trained models out of Git
-models/*
-!models/.gitkeep
+# Keep trained models & artefacts out of Git
+models/*.pkl
+models/*.joblib
+models/*.bin
+models/*.pt
+models/*.onnx
+artefacts/*
+!artefacts/.gitkeep
+
+# Temporary archives and collaborator extraction
+*.zip
+friend_submission/
 
 # OS
 .DS_Store
