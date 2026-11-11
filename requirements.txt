@@ -3,8 +3,16 @@ numpy
 requests
 pyarrow
 jupyter
+nbformat
 matplotlib
 seaborn
 scikit-learn
+lightgbm
+xgboost
+scipy
+joblib
 nba_api
-
+pydantic-settings
+python-dotenv
+sqlalchemy
+pytest
