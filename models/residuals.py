@@ -1,0 +1,504 @@
+"""
+models/residuals.py
+───────────────────
+Out-of-sample prediction generation, residual calculation, and distribution analysis
+for the Version 1 NBA Player Probability Engine.
+
+Design guarantees:
+- Preserves existing trained Minutes Model and 7 Champion LightGBM models untouched.
+- Uses strictly chronological walk-forward shadow models to generate out-of-sample
+  historical predictions for 2022-23, 2023-24, and 2024-25 (never in-sample!).
+- Evaluates the preserved champion models on 2025-26 (validation) and 2026-27 (test).
+- Stores predictions and residuals cleanly separated by statistic in Parquet format.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import joblib
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+TARGETS: List[str] = ["PTS", "REB", "AST", "3PM", "STL", "BLK", "TOV"]
+
+TARGET_ALIAS_MAP: Dict[str, str] = {
+    "PTS": "PTS",
+    "REB": "REB",
+    "AST": "AST",
+    "3PM": "FG3M",
+    "FG3M": "FG3M",
+    "STL": "STL",
+    "BLK": "BLK",
+    "TOV": "TOV",
+}
+
+LARGE_ERROR_ABS_THRESHOLDS: Dict[str, float] = {
+    "PTS": 10.0,
+    "REB": 4.0,
+    "AST": 3.0,
+    "3PM": 2.0,
+    "STL": 2.0,
+    "BLK": 2.0,
+    "TOV": 2.0,
+}
+
+
+def canonical_stat_name(stat: str) -> str:
+    """Normalise stat name to one of TARGETS (e.g. 'FG3M' -> '3PM')."""
+    s = stat.strip().upper()
+    if s == "FG3M":
+        return "3PM"
+    if s not in TARGETS:
+        raise ValueError(f"Unsupported stat '{stat}'. Must be one of {TARGETS}.")
+    return s
+
+
+def calculate_residuals(
+    actual: np.ndarray | pd.Series,
+    predicted: np.ndarray | pd.Series,
+) -> np.ndarray:
+    """
+    Calculate prediction residuals defined consistently as:
+        Residual = Actual statistic - Predicted statistic.
+    """
+    act = np.asarray(actual, dtype=float)
+    pred = np.asarray(predicted, dtype=float)
+    return act - pred
+
+
+def _internal_early_stop_fit(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    val_fraction: float = 0.15,
+) -> lgb.LGBMRegressor:
+    """
+    Fit a walk-forward shadow LightGBM Regressor using an internal trailing chronological
+    split strictly within `X` so future target seasons are never touched even for
+    early stopping.
+    """
+    n = len(X)
+    split_idx = max(100, int(n * (1.0 - val_fraction)))
+    X_tr, y_tr = X.iloc[:split_idx], y[:split_idx]
+    X_es, y_es = X.iloc[split_idx:], y[split_idx:]
+
+    model = lgb.LGBMRegressor(
+        n_estimators=1000,
+        learning_rate=0.03,
+        max_depth=6,
+        num_leaves=31,
+        min_child_samples=50,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=settings.RANDOM_SEED,
+        objective="regression_l1",
+        n_jobs=-1,
+        verbosity=-1,
+    )
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=30, verbose=False),
+        lgb.log_evaluation(period=0),
+    ]
+    model.fit(X_tr, y_tr, eval_set=[(X_es, y_es)], callbacks=callbacks)
+    return model
+
+
+def _fit_walkforward_minutes_for_lookback(
+    full_df: pd.DataFrame,
+    min_feature_cols: List[str],
+    target_seasons: List[str],
+) -> pd.DataFrame:
+    """
+    Generate walk-forward out-of-sample `predicted_minutes` for pre-2022 lookback
+    seasons (`2019-20`, `2020-21`, `2021-22`) using expanding windows starting from 2014-15.
+    """
+    out_frames: List[pd.DataFrame] = []
+    all_seasons = sorted(full_df["SEASON"].unique().tolist())
+
+    for season in target_seasons:
+        if season not in all_seasons:
+            continue
+        prior_seasons = [s for s in all_seasons if s < season]
+        prior_df = full_df[full_df["SEASON"].isin(prior_seasons)]
+        target_df = full_df[full_df["SEASON"] == season].copy()
+
+        m_min = lgb.LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.03,
+            max_depth=5,
+            num_leaves=31,
+            min_child_samples=50,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="regression_l1",
+            random_state=settings.RANDOM_SEED,
+            n_jobs=-1,
+            verbosity=-1,
+        )
+        m_min.fit(prior_df[min_feature_cols], prior_df["MIN"].values)
+        preds = np.clip(m_min.predict(target_df[min_feature_cols]), 5.0, 48.0)
+        target_df["predicted_minutes"] = preds
+        out_frames.append(target_df)
+
+    if not out_frames:
+        return pd.DataFrame()
+    return pd.concat(out_frames, ignore_index=True)
+
+
+def generate_out_of_sample_predictions(
+    stats_list: Optional[List[str]] = None,
+    force_regenerate: bool = False,
+) -> Dict[str, Path]:
+    """
+    Generate and persist genuine chronological out-of-sample historical predictions
+    and residuals for every requested statistic.
+
+    Chronological guarantees:
+    - 2022-23, 2023-24, 2024-25 predictions are generated by walk-forward shadow LightGBM
+      models trained strictly on seasons prior to each predicted season (anchored by
+      2019-20..2021-22 with walk-forward out-of-sample predicted minutes).
+    - 2025-26 and 2026-27 predictions are generated directly by the preserved champion
+      models (`artefacts/champions/champion_{stat}.joblib`) without modifying them.
+    - Every file is stored separately at `data/processed/oos_predictions_{stat}.parquet`.
+    """
+    if stats_list is None:
+        stats_list = list(TARGETS)
+
+    data_dir = settings.nba_data_root / "processed"
+    champions_dir = settings.artefacts_dir / "champions"
+    minutes_model_path = settings.artefacts_dir / "models" / "minutes" / "minutes_model.joblib"
+
+    manifest_path = champions_dir / "champion_manifest.json"
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    # Check if already present and non-forced
+    output_paths: Dict[str, Path] = {}
+    all_exist = True
+    for s in stats_list:
+        canon = canonical_stat_name(s)
+        p = data_dir / f"oos_predictions_{canon.lower()}.parquet"
+        output_paths[canon] = p
+        if not p.exists():
+            all_exist = False
+
+    if all_exist and not force_regenerate:
+        logger.info("All out-of-sample prediction Parquet files already exist.")
+        return output_paths
+
+    # Load saved Minutes model schema
+    min_model = joblib.load(minutes_model_path)
+    min_feature_cols: List[str] = list(min_model.feature_name_)
+
+    # Load v2 splits (already contain leak-free walk-forward predicted_minutes for 2022-27)
+    train_v2 = pd.read_parquet(data_dir / "train_players_v2.parquet")
+    val_v2 = pd.read_parquet(data_dir / "val_players_v2.parquet")
+    test_v2 = pd.read_parquet(data_dir / "test_players_v2.parquet")
+
+    # Ensure 3PM alias and datetime sorting
+    for df in (train_v2, val_v2, test_v2):
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+        if "3PM" not in df.columns and "FG3M" in df.columns:
+            df["3PM"] = df["FG3M"]
+
+    # Load pre-2022 historical matrix for shadow walk-forward base (2014-15..2021-22)
+    full_hist = pd.read_parquet(data_dir / "player_features_pts.parquet")
+    full_hist["GAME_DATE"] = pd.to_datetime(full_hist["GAME_DATE"])
+    full_hist = full_hist.sort_values(["GAME_DATE", "GAME_ID", "PLAYER_ID"]).reset_index(drop=True)
+    if "3PM" not in full_hist.columns and "FG3M" in full_hist.columns:
+        full_hist["3PM"] = full_hist["FG3M"]
+
+    lookback_target_seasons = ["2019-20", "2020-21", "2021-22"]
+    logger.info("Generating walk-forward OOS predicted_minutes for lookback anchor %s ...", lookback_target_seasons)
+    pre_2022_df = _fit_walkforward_minutes_for_lookback(
+        full_hist[full_hist["SEASON"] <= "2021-22"],
+        min_feature_cols=min_feature_cols,
+        target_seasons=lookback_target_seasons,
+    )
+
+    # Combine lookback + train_v2 for chronological walk-forward shadow training
+    walkforward_base = pd.concat([pre_2022_df, train_v2], ignore_index=True)
+    walkforward_base = walkforward_base.sort_values(["GAME_DATE", "GAME_ID", "PLAYER_ID"]).reset_index(drop=True)
+
+    train_seasons = ["2022-23", "2023-24", "2024-25"]
+
+    for s in stats_list:
+        canon = canonical_stat_name(s)
+        target_col = TARGET_ALIAS_MAP[canon]
+        champ_path = champions_dir / f"champion_{canon.lower()}.joblib"
+        champ_model = joblib.load(champ_path)
+        feat_cols: List[str] = list(champ_model.feature_name_)
+        champ_version = manifest.get(canon, {}).get("champion_version", "v2")
+
+        stat_frames: List[pd.DataFrame] = []
+
+        # 1. Walk-forward shadow OOS predictions for 2022-23, 2023-24, 2024-25
+        for season in train_seasons:
+            prior = walkforward_base[walkforward_base["SEASON"] < season]
+            curr = train_v2[train_v2["SEASON"] == season].copy()
+            shadow = _internal_early_stop_fit(prior[feat_cols], prior[target_col].values)
+
+            raw_preds = shadow.predict(curr[feat_cols])
+            preds = np.maximum(0.0, raw_preds)
+            curr_out = _build_prediction_frame(
+                curr,
+                stat=canon,
+                actual_col=target_col,
+                raw_preds=raw_preds,
+                preds=preds,
+                model_version=f"shadow_walkforward_{champ_version}",
+            )
+            stat_frames.append(curr_out)
+            logger.info(
+                "[%s] Shadow OOS %s (n=%d): MAE=%.4f",
+                canon, season, len(curr_out), float(np.mean(np.abs(curr_out["residual"]))),
+            )
+
+        # 2. Preserved champion predictions for 2025-26 (val) & 2026-27 (test)
+        for split_df, split_label in [(val_v2, "val_2025_26"), (test_v2, "test_2026_27")]:
+            raw_preds = champ_model.predict(split_df[feat_cols])
+            preds = np.maximum(0.0, raw_preds)
+            split_out = _build_prediction_frame(
+                split_df,
+                stat=canon,
+                actual_col=target_col,
+                raw_preds=raw_preds,
+                preds=preds,
+                model_version=f"champion_{champ_version}",
+            )
+            stat_frames.append(split_out)
+            logger.info(
+                "[%s] Champion %s (n=%d): MAE=%.4f",
+                canon, split_label, len(split_out), float(np.mean(np.abs(split_out["residual"]))),
+            )
+
+        combined = pd.concat(stat_frames, ignore_index=True)
+        combined = combined.sort_values(["GAME_DATE", "GAME_ID", "PLAYER_ID"]).reset_index(drop=True)
+
+        # Verify zero in-sample leakage or NaN predictions
+        assert combined["predicted_value"].isna().sum() == 0, f"NaN in {canon} predictions"
+        assert combined["residual"].isna().sum() == 0, f"NaN in {canon} residuals"
+
+        out_path = data_dir / f"oos_predictions_{canon.lower()}.parquet"
+        combined.to_parquet(out_path, index=False)
+        output_paths[canon] = out_path
+        logger.info("Saved OOS predictions for %s to %s (%d rows)", canon, out_path, len(combined))
+
+    return output_paths
+
+
+def _build_prediction_frame(
+    df: pd.DataFrame,
+    stat: str,
+    actual_col: str,
+    raw_preds: np.ndarray,
+    preds: np.ndarray,
+    model_version: str,
+) -> pd.DataFrame:
+    """Assemble standardized OOS prediction record table with required metadata."""
+    roll10_col = f"ROLL10_{TARGET_ALIAS_MAP[stat]}_MEAN"
+    season_col = f"SEASON_{TARGET_ALIAS_MAP[stat]}_MEAN"
+
+    roll10_anchor = df[roll10_col] if roll10_col in df.columns else pd.Series(np.nan, index=df.index)
+    season_anchor = df[season_col] if season_col in df.columns else pd.Series(np.nan, index=df.index)
+    anchor_val = roll10_anchor.fillna(season_anchor).fillna(pd.Series(preds, index=df.index))
+
+    actual_vals = df[actual_col].values.astype(float)
+    residuals = calculate_residuals(actual_vals, preds)
+
+    return pd.DataFrame({
+        "PLAYER_ID": df["PLAYER_ID"].values,
+        "PLAYER_NAME": df["PLAYER_NAME"].values,
+        "GAME_ID": df["GAME_ID"].values,
+        "GAME_DATE": pd.to_datetime(df["GAME_DATE"]).values,
+        "SEASON": df["SEASON"].values,
+        "TEAM_ABBREVIATION": df["TEAM_ABBREVIATION"].values,
+        "OPPONENT_ABBREV": df["OPPONENT_ABBREV"].values if "OPPONENT_ABBREV" in df.columns else "",
+        "IS_HOME": df["IS_HOME"].values if "IS_HOME" in df.columns else 1,
+        "ROLL5_MIN_MEAN": df["ROLL5_MIN_MEAN"].values if "ROLL5_MIN_MEAN" in df.columns else np.nan,
+        "ROLL10_MIN_MEAN": df["ROLL10_MIN_MEAN"].values if "ROLL10_MIN_MEAN" in df.columns else np.nan,
+        "ROLL5_STARTER_PCT": df["ROLL5_STARTER_PCT"].values if "ROLL5_STARTER_PCT" in df.columns else np.nan,
+        "ROLL10_STAT_MEAN": anchor_val.values,
+        "stat": stat,
+        "predicted_minutes": df["predicted_minutes"].values,
+        "actual_minutes": df["MIN"].values,
+        "raw_predicted_value": raw_preds,
+        "predicted_value": preds,
+        "actual_value": actual_vals,
+        "residual": residuals,
+        "model_version": model_version,
+    })
+
+
+def load_oos_predictions(
+    stat: str,
+    seasons: Optional[List[str]] = None,
+    max_date: Optional[str | pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    Load persisted out-of-sample predictions and residuals for a statistic,
+    optionally filtering to specific seasons or strictly prior to `max_date`.
+    """
+    canon = canonical_stat_name(stat)
+    path = settings.nba_data_root / "processed" / f"oos_predictions_{canon.lower()}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"OOS predictions file not found at {path}. Run generate_out_of_sample_predictions() first.")
+
+    df = pd.read_parquet(path)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    if seasons is not None:
+        df = df[df["SEASON"].isin(seasons)].copy()
+    if max_date is not None:
+        cutoff = pd.to_datetime(max_date)
+        df = df[df["GAME_DATE"] < cutoff].copy()
+    return df.reset_index(drop=True)
+
+
+def analyse_residual_distribution(df: pd.DataFrame, stat: str) -> Dict[str, Any]:
+    """
+    Perform comprehensive Phase 2 statistical analysis of out-of-sample residuals.
+    """
+    canon = canonical_stat_name(stat)
+    res = df["residual"].values.astype(float)
+    pred = df["predicted_value"].values.astype(float)
+    act = df["actual_value"].values.astype(float)
+    pred_min = df["predicted_minutes"].values.astype(float)
+
+    mean_res = float(np.mean(res))
+    med_res = float(np.median(res))
+    std_res = float(np.std(res, ddof=1))
+    mae = float(np.mean(np.abs(res)))
+    rmse = float(np.sqrt(np.mean(res ** 2)))
+
+    skew = float(stats.skew(res))
+    kurt = float(stats.kurtosis(res))  # excess kurtosis (0 for Normal)
+    jb_stat, jb_pval = stats.jarque_bera(res)
+
+    pct_zero_actual = float((act == 0).mean() * 100.0)
+    pct_raw_pred_neg = float((df["raw_predicted_value"].values < 0).mean() * 100.0)
+
+    abs_thresh = LARGE_ERROR_ABS_THRESHOLDS[canon]
+    pct_large_2std = float((np.abs(res) > 2.0 * std_res).mean() * 100.0)
+    pct_large_domain = float((np.abs(res) >= abs_thresh).mean() * 100.0)
+
+    # Correlations (heteroscedasticity checks)
+    corr_pred_abs_res, _ = stats.pearsonr(pred, np.abs(res))
+    corr_pred_res, _ = stats.pearsonr(pred, res)
+    corr_min_abs_res, _ = stats.pearsonr(pred_min, np.abs(res))
+    corr_min_res, _ = stats.pearsonr(pred_min, res)
+
+    # Quantiles of residuals
+    q_vals = np.percentile(res, [1, 5, 10, 25, 50, 75, 90, 95, 99])
+
+    # Minutes bucket breakdown
+    min_bins = pd.cut(
+        pred_min,
+        bins=[0, 15, 25, 32, 60],
+        labels=["<15m", "15-25m", "25-32m", "32+m"],
+        right=False,
+    )
+    min_bucket_stats = {}
+    for bucket in ["<15m", "15-25m", "25-32m", "32+m"]:
+        mask = np.asarray(min_bins == bucket)
+        if mask.sum() > 0:
+            sub_r = res[mask]
+            min_bucket_stats[bucket] = {
+                "n": int(mask.sum()),
+                "mean_res": round(float(np.mean(sub_r)), 4),
+                "std_res": round(float(np.std(sub_r, ddof=1)) if mask.sum() > 1 else 0.0, 4),
+                "mae": round(float(np.mean(np.abs(sub_r))), 4),
+            }
+
+    # Predicted value quantile breakdown (detect heteroscedasticity across pred magnitude)
+    try:
+        pred_q = pd.qcut(pred, q=4, duplicates="drop")
+        cats = pred_q.cat.categories if hasattr(pred_q, "cat") else pred_q.categories
+        pred_bucket_stats = {}
+        for cat in cats:
+            mask = np.asarray(pred_q == cat)
+            sub_r = res[mask]
+            pred_bucket_stats[str(cat)] = {
+                "n": int(mask.sum()),
+                "mean_res": round(float(np.mean(sub_r)), 4),
+                "std_res": round(float(np.std(sub_r, ddof=1)) if mask.sum() > 1 else 0.0, 4),
+                "mae": round(float(np.mean(np.abs(sub_r))), 4),
+            }
+    except Exception:
+        pred_bucket_stats = {}
+
+    # Role breakdown (Starter vs Bench)
+    is_starter = (
+        (df["ROLL5_STARTER_PCT"] >= 0.5)
+        if "ROLL5_STARTER_PCT" in df.columns and df["ROLL5_STARTER_PCT"].notna().any()
+        else (df["ROLL5_MIN_MEAN"] >= 24.0)
+    ).to_numpy()
+    role_stats = {}
+    for label, mask in [("Starters", is_starter), ("Bench", ~is_starter)]:
+        if mask.sum() > 0:
+            sub_r = res[mask]
+            role_stats[label] = {
+                "n": int(mask.sum()),
+                "mean_res": round(float(np.mean(sub_r)), 4),
+                "std_res": round(float(np.std(sub_r, ddof=1)) if mask.sum() > 1 else 0.0, 4),
+                "mae": round(float(np.mean(np.abs(sub_r))), 4),
+                "pct_zero_actual": round(float((act[mask] == 0).mean() * 100.0), 2),
+            }
+
+    # Shape diagnosis
+    is_normal_like = abs(skew) < 0.5 and abs(kurt) < 1.0 and pct_zero_actual < 15.0
+    if pct_zero_actual >= 35.0:
+        shape_note = "Zero-inflated right-skewed discrete count distribution (strongly non-Normal)"
+    elif skew > 0.75:
+        shape_note = "Right-skewed with heavy upper tail (non-Normal)"
+    elif kurt > 1.5:
+        shape_note = "Heavy-tailed symmetric/moderately skewed (leptokurtic)"
+    else:
+        shape_note = "Moderately skewed near-bell shape, heteroscedastic with minutes/volume"
+
+    return {
+        "stat": canon,
+        "n_obs": int(len(df)),
+        "mean_residual": round(mean_res, 4),
+        "median_residual": round(med_res, 4),
+        "std_residual": round(std_res, 4),
+        "mae": round(mae, 4),
+        "rmse": round(rmse, 4),
+        "skewness": round(skew, 4),
+        "excess_kurtosis": round(kurt, 4),
+        "jarque_bera_stat": round(float(jb_stat), 2),
+        "jarque_bera_pval": float(jb_pval),
+        "is_approx_normal": bool(is_normal_like),
+        "shape_diagnosis": shape_note,
+        "pct_zero_actual": round(pct_zero_actual, 2),
+        "pct_raw_pred_negative": round(pct_raw_pred_neg, 2),
+        "pct_large_error_gt_2std": round(pct_large_2std, 2),
+        "large_error_domain_thresh": abs_thresh,
+        "pct_large_error_domain": round(pct_large_domain, 2),
+        "corr_pred_vs_abs_residual": round(float(corr_pred_abs_res), 4),
+        "corr_pred_vs_residual": round(float(corr_pred_res), 4),
+        "corr_pred_min_vs_abs_residual": round(float(corr_min_abs_res), 4),
+        "corr_pred_min_vs_residual": round(float(corr_min_res), 4),
+        "quantiles": {
+            "p01": round(float(q_vals[0]), 3),
+            "p05": round(float(q_vals[1]), 3),
+            "p10": round(float(q_vals[2]), 3),
+            "p25": round(float(q_vals[3]), 3),
+            "p50": round(float(q_vals[4]), 3),
+            "p75": round(float(q_vals[5]), 3),
+            "p90": round(float(q_vals[6]), 3),
+            "p95": round(float(q_vals[7]), 3),
+            "p99": round(float(q_vals[8]), 3),
+        },
+        "by_minutes_bucket": min_bucket_stats,
+        "by_predicted_quartile": pred_bucket_stats,
+        "by_role": role_stats,
+    }
