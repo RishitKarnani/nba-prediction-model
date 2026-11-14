@@ -25,6 +25,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from data.loader import get_common_players, get_player_logs, get_team_logs
+from data.schedule import get_daily_schedule, get_team_recent_rotation
 from models.inference import PlayerProbabilityEngine
 from models.probability import LineProbabilityResult, OutcomeDistribution
 from models.residuals import TARGETS, canonical_stat_name
@@ -199,32 +200,109 @@ def main():
     # ── Sidebar: Matchup Setup ────────────────────────────────────────────────
     st.sidebar.header("🎯 Matchup Selector")
 
-    selected_player = st.sidebar.selectbox(
-        "NBA Player",
-        options=all_players,
+    selector_mode = st.sidebar.radio(
+        "Selection Mode",
+        options=["📅 Live NBA Schedule (Upcoming Games)", "🔍 Custom Player Search"],
         index=0,
-        help="Type or select any NBA player to analyze.",
+        help="Choose between real upcoming NBA games on the schedule or searching any player manually.",
     )
 
-    col_side1, col_side2 = st.sidebar.columns(2)
-    with col_side1:
-        default_opp_idx = team_options.index("GSW") if "GSW" in team_options else 0
-        selected_opp = st.selectbox(
-            "Opponent",
-            options=team_options,
-            index=default_opp_idx,
-            format_func=lambda x: team_map.get(x, x),
+    if selector_mode == "📅 Live NBA Schedule (Upcoming Games)":
+        date_preset = st.sidebar.radio(
+            "Schedule Date",
+            options=["Tomorrow", "Today", "Custom Date"],
+            index=0,
+            horizontal=True,
         )
 
-    with col_side2:
-        venue = st.selectbox("Venue", options=["Home (vs.)", "Away (@)"], index=0)
-        is_home = 1 if "Home" in venue else 0
+        today_dt = datetime.date.today()
+        if date_preset == "Tomorrow":
+            target_date = today_dt + datetime.timedelta(days=1)
+        elif date_preset == "Today":
+            target_date = today_dt
+        else:
+            target_date = st.sidebar.date_input("Select Date", value=today_dt + datetime.timedelta(days=1))
 
-    target_date = st.sidebar.date_input(
-        "Matchup Date",
-        value=datetime.date(2026, 11, 1),
-        help="Date of the target game (ensures leak-free historical feature calculation strictly before this date).",
-    )
+        # Fetch live games for that date
+        scheduled_games = get_daily_schedule(target_date)
+
+        if scheduled_games:
+            game_labels = [g["label"] for g in scheduled_games]
+            chosen_game_idx = st.sidebar.selectbox(
+                f"Games on {target_date.strftime('%b %d, %Y')} ({len(scheduled_games)} scheduled)",
+                options=range(len(scheduled_games)),
+                format_func=lambda i: game_labels[i],
+            )
+            game_info = scheduled_games[chosen_game_idx]
+            away_team = game_info["away_team_abbrev"]
+            home_team = game_info["home_team_abbrev"]
+
+            # Team picker within the matchup
+            team_choice = st.sidebar.radio(
+                "Select Team",
+                options=[f"{away_team} (Away)", f"{home_team} (Home)"],
+                index=0,
+                horizontal=True,
+            )
+
+            is_away_selected = team_choice.startswith(away_team)
+            focus_team = away_team if is_away_selected else home_team
+            selected_opp = home_team if is_away_selected else away_team
+            is_home = 0 if is_away_selected else 1
+
+            # Fetch active rotation players for the chosen team
+            rotation = get_team_recent_rotation(focus_team)
+            if rotation:
+                player_choices = [p["player_name"] for p in rotation]
+                player_labels = {p["player_name"]: p["display"] for p in rotation}
+                selected_player = st.sidebar.selectbox(
+                    f"Select Player from {focus_team}",
+                    options=player_choices,
+                    format_func=lambda p: player_labels.get(p, p),
+                    index=0,
+                )
+            else:
+                # Fallback to general player list if rotation logs not available
+                selected_player = st.sidebar.selectbox("Select Player", options=all_players, index=0)
+
+        else:
+            st.sidebar.info(f"No official games found for {target_date}. Switching to manual selection.")
+            selected_player = st.sidebar.selectbox("NBA Player", options=all_players, index=0)
+            col_side1, col_side2 = st.sidebar.columns(2)
+            with col_side1:
+                selected_opp = st.selectbox("Opponent", options=team_options, index=0, format_func=lambda x: team_map.get(x, x))
+            with col_side2:
+                venue = st.selectbox("Venue", options=["Home (vs.)", "Away (@)"], index=0)
+                is_home = 1 if "Home" in venue else 0
+
+    else:
+        # Custom Player Search Mode
+        selected_player = st.sidebar.selectbox(
+            "NBA Player",
+            options=all_players,
+            index=0,
+            help="Type or select any NBA player to analyze.",
+        )
+
+        col_side1, col_side2 = st.sidebar.columns(2)
+        with col_side1:
+            default_opp_idx = team_options.index("GSW") if "GSW" in team_options else 0
+            selected_opp = st.selectbox(
+                "Opponent",
+                options=team_options,
+                index=default_opp_idx,
+                format_func=lambda x: team_map.get(x, x),
+            )
+
+        with col_side2:
+            venue = st.selectbox("Venue", options=["Home (vs.)", "Away (@)"], index=0)
+            is_home = 1 if "Home" in venue else 0
+
+        target_date = st.sidebar.date_input(
+            "Matchup Date",
+            value=datetime.date(2026, 11, 1),
+            help="Date of the target game (ensures leak-free historical feature calculation strictly before this date).",
+        )
 
     # Advanced Settings in Expander
     with st.sidebar.expander("⚙️ Advanced Parameters"):
@@ -517,3 +595,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
