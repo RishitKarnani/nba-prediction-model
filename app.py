@@ -1,8 +1,9 @@
 """
-NBA Player Performance & Probability Engine — Interactive Testing Dashboard
-===========================================================================
-Interactive Streamlit application for scenario testing, probability estimation,
-and outcome distribution visualization.
+NBA Player Performance & Probability Engine — 2-Day Matchup Forecast UI
+========================================================================
+Streamlined interface for today's and tomorrow's upcoming NBA games.
+Automatically detects home/away teams, active rosters, and generates
+leak-free minutes, stat forecasts, and threshold probabilities.
 """
 
 from __future__ import annotations
@@ -42,10 +43,28 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    .matchup-banner {
+        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+        color: white;
+        padding: 20px 24px;
+        border-radius: 12px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+    }
+    .matchup-teams {
+        font-size: 1.5rem;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+    }
+    .matchup-meta {
+        font-size: 0.9rem;
+        opacity: 0.9;
+        margin-top: 4px;
+    }
     .metric-card {
         background-color: #f8f9fa;
         border-radius: 10px;
-        padding: 15px;
+        padding: 14px 10px;
         border: 1px solid #e9ecef;
         text-align: center;
         box-shadow: 0 2px 4px rgba(0,0,0,0.02);
@@ -101,65 +120,13 @@ def get_cached_engine() -> PlayerProbabilityEngine:
     return PlayerProbabilityEngine()
 
 
-@st.cache_data(show_spinner="Loading NBA rosters and teams...")
-def get_players_and_teams() -> Tuple[List[str], Dict[str, str], List[str]]:
-    """Return sorted player display list, teams dict, and team abbrev list."""
-    # 1. Teams
-    teams_df = get_team_logs()
-    team_map: Dict[str, str] = {}
-    for _, row in (
-        teams_df[["TEAM_ABBREVIATION", "TEAM_NAME"]]
-        .drop_duplicates()
-        .iterrows()
-    ):
-        abbrev = str(row["TEAM_ABBREVIATION"])
-        name = str(row["TEAM_NAME"])
-        team_map[abbrev] = f"{abbrev} — {name}"
-
-    team_options = sorted(list(team_map.keys()))
-
-    # 2. Players (prioritize recent active rotation players)
-    try:
-        p_logs = get_player_logs(seasons=["2024-25", "2025-26", "2026-27"])
-        recent_counts = p_logs["PLAYER_NAME"].value_counts()
-        recent_players = recent_counts[recent_counts >= 10].index.tolist()
-    except Exception:
-        c_players = get_common_players()
-        recent_players = sorted(c_players["DISPLAY_FIRST_LAST"].dropna().unique().tolist())
-
-    # Star players to feature at top of list
-    featured_stars = [
-        "LeBron James",
-        "Stephen Curry",
-        "Nikola Jokić",
-        "Luka Dončić",
-        "Giannis Antetokounmpo",
-        "Jayson Tatum",
-        "Kevin Durant",
-        "Anthony Edwards",
-        "Shai Gilgeous-Alexander",
-        "Joel Embiid",
-        "Damian Lillard",
-        "Anthony Davis",
-        "Trae Young",
-        "Donovan Mitchell",
-    ]
-
-    all_other = sorted([p for p in recent_players if p not in featured_stars])
-    final_players = [p for p in featured_stars if p in recent_players or True] + all_other
-
-    return final_players, team_map, team_options
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_schedule_for_date(date_str: str) -> List[Dict]:
+    return get_daily_schedule(date_str)
 
 
 # ── Natural Language Query Parser ─────────────────────────────────────────────
 def parse_natural_language_query(query: str, player_name: str) -> Optional[Tuple[str, float]]:
-    """
-    Parse a simple natural language question like:
-    - 'Will Curry score more than 25.5 points?'
-    - 'Can LeBron get over 7.5 assists?'
-    - 'Probability of over 2.5 3pm?'
-    Returns (stat, line) or None.
-    """
     q = query.lower()
     stat_found: Optional[str] = None
 
@@ -178,7 +145,6 @@ def parse_natural_language_query(query: str, player_name: str) -> Optional[Tuple
             stat_found = s
             break
 
-    # Look for a number (e.g., 25.5 or 25)
     match = re.search(r"\b(\d+(?:\.\d+)?)\b", q)
     if stat_found and match:
         val = float(match.group(1))
@@ -190,122 +156,116 @@ def parse_natural_language_query(query: str, player_name: str) -> Optional[Tuple
 # ── Main Application UI ───────────────────────────────────────────────────────
 def main():
     engine = get_cached_engine()
-    all_players, team_map, team_options = get_players_and_teams()
 
     st.title("🏀 NBA Player Performance & Probability Engine")
-    st.markdown(
-        "**Version 1.0 Production System** — LightGBM Minutes Conditioning & Role-Conditional Residual Bootstrap"
-    )
+    st.caption("Live 2-Day Upcoming Matchup Predictions & Threshold Probability Estimator")
 
-    # ── Sidebar: Matchup Setup ────────────────────────────────────────────────
-    st.sidebar.header("🎯 Matchup Selector")
+    # ── Sidebar: 2-Day Matchup Selection Workflow ─────────────────────────────
+    st.sidebar.header("📅 Select Upcoming Matchup")
 
-    selector_mode = st.sidebar.radio(
-        "Selection Mode",
-        options=["📅 Live NBA Schedule (Upcoming Games)", "🔍 Custom Player Search"],
+    today_dt = datetime.date.today()
+    tomorrow_dt = today_dt + datetime.timedelta(days=1)
+
+    # 2-Day Slate Selector
+    day_options = {
+        f"Today ({today_dt.strftime('%b %d')})": today_dt,
+        f"Tomorrow ({tomorrow_dt.strftime('%b %d')})": tomorrow_dt,
+    }
+
+    selected_day_label = st.sidebar.radio(
+        "Matchup Slate",
+        options=list(day_options.keys()),
         index=0,
-        help="Choose between real upcoming NBA games on the schedule or searching any player manually.",
+    )
+    target_date = day_options[selected_day_label]
+
+    # Optional Custom Date expander if user ever needs to check another date
+    with st.sidebar.expander("🔍 Or check another date"):
+        custom_input = st.text_input("Enter date (e.g. 16/11/26 or 2026-11-16)", placeholder="DD/MM/YY")
+        if custom_input.strip():
+            try:
+                target_date = pd.to_datetime(custom_input.strip(), dayfirst=True).date()
+                st.sidebar.caption(f"Showing games for: **{target_date.strftime('%a, %b %d, %Y')}**")
+            except Exception:
+                st.sidebar.error("Invalid date format. Use DD/MM/YY or YYYY-MM-DD.")
+
+    # Fetch official NBA schedule for the chosen date
+    date_str = target_date.strftime("%Y-%m-%d")
+    scheduled_games = fetch_schedule_for_date(date_str)
+
+    if not scheduled_games:
+        st.warning(f"No scheduled NBA games found for **{target_date.strftime('%a, %b %d, %Y')}**.")
+        st.info("The NBA might not have games scheduled for this date (e.g. off-day or break). Select another day from the sidebar.")
+        return
+
+    st.sidebar.markdown("---")
+
+    # ── Step 1: Select Game ───────────────────────────────────────────────────
+    game_labels = [g["label"] for g in scheduled_games]
+    chosen_game_idx = st.sidebar.selectbox(
+        f"Select Game ({len(scheduled_games)} scheduled on {target_date.strftime('%b %d')})",
+        options=range(len(scheduled_games)),
+        format_func=lambda i: game_labels[i],
+    )
+    game_info = scheduled_games[chosen_game_idx]
+
+    away_team_abbrev = game_info["away_team_abbrev"]
+    away_team_name = game_info["away_team_name"]
+    home_team_abbrev = game_info["home_team_abbrev"]
+    home_team_name = game_info["home_team_name"]
+    game_status = game_info["game_status"]
+
+    # ── Step 2: Select Team (Auto Home / Away) ────────────────────────────────
+    st.sidebar.markdown("**Select Team:**")
+    team_choice = st.sidebar.radio(
+        "Select Team",
+        options=[
+            f"✈️ Away: {away_team_name} ({away_team_abbrev})",
+            f"🏠 Home: {home_team_name} ({home_team_abbrev})",
+        ],
+        index=0,
+        label_visibility="collapsed",
     )
 
-    if selector_mode == "📅 Live NBA Schedule (Upcoming Games)":
-        date_preset = st.sidebar.radio(
-            "Schedule Date",
-            options=["Tomorrow", "Today", "Custom Date"],
-            index=0,
-            horizontal=True,
-        )
-
-        today_dt = datetime.date.today()
-        if date_preset == "Tomorrow":
-            target_date = today_dt + datetime.timedelta(days=1)
-        elif date_preset == "Today":
-            target_date = today_dt
-        else:
-            target_date = st.sidebar.date_input("Select Date", value=today_dt + datetime.timedelta(days=1))
-
-        # Fetch live games for that date
-        scheduled_games = get_daily_schedule(target_date)
-
-        if scheduled_games:
-            game_labels = [g["label"] for g in scheduled_games]
-            chosen_game_idx = st.sidebar.selectbox(
-                f"Games on {target_date.strftime('%b %d, %Y')} ({len(scheduled_games)} scheduled)",
-                options=range(len(scheduled_games)),
-                format_func=lambda i: game_labels[i],
-            )
-            game_info = scheduled_games[chosen_game_idx]
-            away_team = game_info["away_team_abbrev"]
-            home_team = game_info["home_team_abbrev"]
-
-            # Team picker within the matchup
-            team_choice = st.sidebar.radio(
-                "Select Team",
-                options=[f"{away_team} (Away)", f"{home_team} (Home)"],
-                index=0,
-                horizontal=True,
-            )
-
-            is_away_selected = team_choice.startswith(away_team)
-            focus_team = away_team if is_away_selected else home_team
-            selected_opp = home_team if is_away_selected else away_team
-            is_home = 0 if is_away_selected else 1
-
-            # Fetch active rotation players for the chosen team
-            rotation = get_team_recent_rotation(focus_team)
-            if rotation:
-                player_choices = [p["player_name"] for p in rotation]
-                player_labels = {p["player_name"]: p["display"] for p in rotation}
-                selected_player = st.sidebar.selectbox(
-                    f"Select Player from {focus_team}",
-                    options=player_choices,
-                    format_func=lambda p: player_labels.get(p, p),
-                    index=0,
-                )
-            else:
-                # Fallback to general player list if rotation logs not available
-                selected_player = st.sidebar.selectbox("Select Player", options=all_players, index=0)
-
-        else:
-            st.sidebar.info(f"No official games found for {target_date}. Switching to manual selection.")
-            selected_player = st.sidebar.selectbox("NBA Player", options=all_players, index=0)
-            col_side1, col_side2 = st.sidebar.columns(2)
-            with col_side1:
-                selected_opp = st.selectbox("Opponent", options=team_options, index=0, format_func=lambda x: team_map.get(x, x))
-            with col_side2:
-                venue = st.selectbox("Venue", options=["Home (vs.)", "Away (@)"], index=0)
-                is_home = 1 if "Home" in venue else 0
-
+    is_away_selected = team_choice.startswith("✈️")
+    if is_away_selected:
+        focus_team = away_team_abbrev
+        focus_team_name = away_team_name
+        opponent_team = home_team_abbrev
+        opponent_team_name = home_team_name
+        is_home = 0
+        venue_str = f"@ {home_team_name} ({home_team_abbrev})"
     else:
-        # Custom Player Search Mode
+        focus_team = home_team_abbrev
+        focus_team_name = home_team_name
+        opponent_team = away_team_abbrev
+        opponent_team_name = away_team_name
+        is_home = 1
+        venue_str = f"vs. {away_team_name} ({away_team_abbrev})"
+
+    # ── Step 3: Select Player from That Team's Rotation ───────────────────────
+    rotation = get_team_recent_rotation(focus_team)
+
+    if rotation:
+        player_choices = [p["player_name"] for p in rotation]
+        player_labels = {p["player_name"]: p["display"] for p in rotation}
         selected_player = st.sidebar.selectbox(
-            "NBA Player",
-            options=all_players,
+            f"Select Player ({focus_team_name})",
+            options=player_choices,
+            format_func=lambda p: player_labels.get(p, p),
             index=0,
-            help="Type or select any NBA player to analyze.",
+            help="Rotation players sorted by average playing time.",
         )
+    else:
+        # Fallback to general player logs for that team
+        p_logs = get_player_logs()
+        team_players = sorted(p_logs[p_logs["TEAM_ABBREVIATION"] == focus_team]["PLAYER_NAME"].unique().tolist())
+        if not team_players:
+            team_players = sorted(p_logs["PLAYER_NAME"].unique().tolist())
+        selected_player = st.sidebar.selectbox(f"Select Player ({focus_team})", options=team_players, index=0)
 
-        col_side1, col_side2 = st.sidebar.columns(2)
-        with col_side1:
-            default_opp_idx = team_options.index("GSW") if "GSW" in team_options else 0
-            selected_opp = st.selectbox(
-                "Opponent",
-                options=team_options,
-                index=default_opp_idx,
-                format_func=lambda x: team_map.get(x, x),
-            )
-
-        with col_side2:
-            venue = st.selectbox("Venue", options=["Home (vs.)", "Away (@)"], index=0)
-            is_home = 1 if "Home" in venue else 0
-
-        target_date = st.sidebar.date_input(
-            "Matchup Date",
-            value=datetime.date(2026, 11, 1),
-            help="Date of the target game (ensures leak-free historical feature calculation strictly before this date).",
-        )
-
-    # Advanced Settings in Expander
-    with st.sidebar.expander("⚙️ Advanced Parameters"):
+    # Simulation Settings in Sidebar Expander
+    with st.sidebar.expander("⚙️ Simulation Settings"):
         n_sims = st.slider("Monte Carlo Draws", min_value=2000, max_value=20000, value=10000, step=2000)
         sim_seed = st.number_input("Random Seed", value=42, step=1)
 
@@ -314,15 +274,15 @@ def main():
         with st.spinner(f"Simulating {n_sims:,} games for {selected_player}..."):
             result = engine.predict_player(
                 player=selected_player,
-                opponent=selected_opp,
+                opponent=opponent_team,
                 is_home=is_home,
-                game_date=str(target_date),
+                game_date=date_str,
                 n_simulations=n_sims,
                 seed=sim_seed,
             )
     except Exception as e:
         st.error(f"Error generating projection for **{selected_player}**: {e}")
-        st.info("Tip: Try adjusting the game date or selecting another active player.")
+        st.info("Tip: If this player has no historical games before this date, try another rotation player.")
         return
 
     meta = result.get("metadata", {})
@@ -332,33 +292,52 @@ def main():
     pred_stats = result["predicted_stats"]
     distributions: Dict[str, OutcomeDistribution] = result["distributions"]
 
-    # ── Header Matchup Card ───────────────────────────────────────────────────
-    st.markdown("---")
-    head_col1, head_col2, head_col3 = st.columns([3, 2, 2])
-    with head_col1:
-        venue_symbol = "vs." if is_home else "@"
-        st.subheader(f"**{meta.get('player_name', selected_player)}** ({meta.get('team_abbreviation', 'NBA')})")
-        st.markdown(f"**Matchup:** {meta.get('team_abbreviation', '')} {venue_symbol} **{meta.get('opponent_abbrev', selected_opp)}**")
-        st.caption(f"📅 Game Date: **{meta.get('game_date', str(target_date))}** | Prior games in database: {meta.get('n_prior_games', 'N/A')}")
+    # ── Main View: Matchup Header Banner ──────────────────────────────────────
+    st.markdown(
+        f"""
+        <div class="matchup-banner">
+            <div class="matchup-teams">
+                {away_team_name} ({away_team_abbrev}) &nbsp;@&nbsp; {home_team_name} ({home_team_abbrev})
+            </div>
+            <div class="matchup-meta">
+                📅 <b>{target_date.strftime('%A, %b %d, %Y')}</b> &nbsp;|&nbsp; 
+                ⏰ <b>{game_status}</b> &nbsp;|&nbsp; 
+                Focus: <b>{meta.get('player_name', selected_player)}</b> ({focus_team}) {venue_str}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with head_col2:
+    # Top KPI Row
+    kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+    with kpi_col1:
         st.metric(
             label="Predicted Playing Time",
             value=f"{pred_min:.1f} MIN",
             delta=f"Role: {role_label}",
             delta_color="normal" if is_starter else "off",
         )
-
-    with head_col3:
+    with kpi_col2:
         pts_pred = pred_stats.get("PTS", 0.0)
-        pts_sim_mean = distributions["PTS"].distribution_mean
+        pts_mean = distributions["PTS"].distribution_mean
         st.metric(
             label="Points Forecast (PTS)",
             value=f"{pts_pred:.1f}",
-            delta=f"Sim Mean: {pts_sim_mean:.1f}",
+            delta=f"Sim Mean: {pts_mean:.1f}",
+        )
+    with kpi_col3:
+        reb_pred = pred_stats.get("REB", 0.0)
+        ast_pred = pred_stats.get("AST", 0.0)
+        st.metric(
+            label="Rebounds & Assists",
+            value=f"{reb_pred:.1f} REB",
+            delta=f"{ast_pred:.1f} AST",
         )
 
-    # ── Section 1: 7 Statistical Point Projections ─────────────────────────────
+    st.markdown("---")
+
+    # ── Section 1: 7-Statistic Forecast Cards ─────────────────────────────────
     st.markdown("### 📊 7-Statistic Projections (LightGBM Median vs. Empirical Mean)")
     cols = st.columns(7)
 
@@ -395,17 +374,15 @@ def main():
 
     st.markdown("---")
 
-    # ── Section 2: Interactive Probability Engine & Line Tester ────────────────
-    st.markdown("### 🎲 Interactive Probability & Line Testing Engine")
-    st.write(
-        "Enter or slide any threshold line below to calculate real-time **Over**, **Under**, and **Push** probabilities from 10,000 Monte Carlo draws."
-    )
+    # ── Section 2: Interactive Probability & Threshold Testing Engine ────────
+    st.markdown("### 🎲 Interactive Probability & Threshold Testing")
+    st.caption("Calculate exact Over, Under, and Push probabilities for any line based on 10,000 empirical draws.")
 
     calc_col1, calc_col2 = st.columns([1, 2])
 
     with calc_col1:
         chosen_stat = st.selectbox(
-            "Select Target Statistic",
+            "Select Statistic to Test",
             options=TARGETS,
             index=0,
             format_func=lambda s: f"{s} ({stat_descriptions.get(s, '')})",
@@ -413,20 +390,18 @@ def main():
         curr_dist = distributions[chosen_stat]
         curr_point = pred_stats.get(chosen_stat, 0.0)
 
-        # Quick default suggestion around point prediction
         default_line = round(curr_point + 0.5, 1)
 
         chosen_line = st.number_input(
-            f"Set {chosen_stat} Line",
+            f"Set {chosen_stat} Threshold Line",
             min_value=0.0,
             max_value=100.0,
             value=float(default_line),
             step=0.5,
             format="%.1f",
-            help="Supports standard half-point lines (24.5) and integer lines (25.0).",
+            help="Supports standard half-point lines (e.g. 24.5) and integer push lines (e.g. 25.0).",
         )
 
-        # Quick preset buttons
         st.write("Quick Presets:")
         preset_cols = st.columns(4)
         presets = [
@@ -440,7 +415,6 @@ def main():
             if preset_cols[b_idx].button(f"{p_val:.1f}", key=f"btn_preset_{b_idx}"):
                 chosen_line = p_val
 
-    # Calculate probability result
     line_res: LineProbabilityResult = curr_dist.probability_for_line(chosen_line)
     p_over = line_res.prob_over
     p_under = line_res.prob_under
@@ -448,7 +422,7 @@ def main():
     is_int_line = line_res.is_integer_line
 
     with calc_col2:
-        st.markdown(f"#### Probability Outcome for **{chosen_stat} Line: {chosen_line:.1f}**")
+        st.markdown(f"#### Probability for **{chosen_stat} Line: {chosen_line:.1f}**")
 
         res_cols = st.columns(3 if is_int_line else 2)
         with res_cols[0]:
@@ -483,24 +457,21 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-        # Context badge
         st.caption(
-            f"Simulation Model: **{line_res.method_used}** | "
-            f"Peer Context: **{line_res.fallback_tier}** ({line_res.n_support:,} comparable historical games) | "
+            f"Peer Context: **{line_res.fallback_tier}** ({line_res.n_support:,} comparable games) | "
             f"Calibration: `{line_res.calibration_status}`"
         )
 
-    # ── Section 3: Distribution Chart Visualization ───────────────────────────
+    # ── Section 3: Distribution Chart ─────────────────────────────────────────
     st.markdown("---")
-    st.markdown(f"### 📈 Simulated Outcome Distribution: {selected_player} ({chosen_stat})")
+    st.markdown(f"### 📈 Simulated Outcome Distribution: {meta.get('player_name', selected_player)} ({chosen_stat})")
 
     outcomes = curr_dist.outcomes
     max_val = int(np.percentile(outcomes, 99.5)) + 4
     bins = np.arange(-0.5, max_val + 1.5, 1.0)
 
-    fig, ax = plt.subplots(figsize=(10, 4.2))
+    fig, ax = plt.subplots(figsize=(10, 4.0))
 
-    # Color bars based on over/under
     n_counts, bin_edges = np.histogram(outcomes, bins=bins)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
@@ -516,14 +487,13 @@ def main():
 
     ax.bar(bin_centers, n_counts / len(outcomes) * 100, width=0.85, color=colors, alpha=0.85, edgecolor="#333", linewidth=0.5)
 
-    # Vertical markers
     ax.axvline(curr_point, color="#1a73e8", linestyle="--", linewidth=2, label=f"LightGBM Median ({curr_point:.1f})")
     ax.axvline(curr_dist.distribution_mean, color="#8e24aa", linestyle="-.", linewidth=2, label=f"Simulated Mean ({curr_dist.distribution_mean:.1f})")
-    ax.axvline(chosen_line, color="#000000", linestyle="-", linewidth=2.5, label=f"Threshold Line ({chosen_line:.1f})")
+    ax.axvline(chosen_line, color="#000000", linestyle="-", linewidth=2.5, label=f"Line ({chosen_line:.1f})")
 
-    ax.set_title(f"{meta.get('player_name', selected_player)} — Simulated {chosen_stat} Outcome Frequency ({n_sims:,} Draws)", fontsize=12, fontweight="bold")
-    ax.set_xlabel(f"Actual {chosen_stat} in Game", fontsize=10)
-    ax.set_ylabel("Probability Frequency (%)", fontsize=10)
+    ax.set_title(f"{meta.get('player_name', selected_player)} — {chosen_stat} Probability Distribution ({n_sims:,} Draws)", fontsize=11, fontweight="bold")
+    ax.set_xlabel(f"Actual {chosen_stat}", fontsize=10)
+    ax.set_ylabel("Probability (%)", fontsize=10)
     ax.set_xlim(-0.5, max_val + 0.5)
     ax.grid(axis="y", linestyle=":", alpha=0.6)
     ax.legend(loc="upper right", framealpha=0.9)
@@ -531,10 +501,10 @@ def main():
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
-    # ── Section 4: Multi-Stat Common Lines Table ──────────────────────────────
+    # ── Section 4: Multi-Stat Quick Consensus Table ──────────────────────────
     st.markdown("---")
     st.markdown("### 📋 Multi-Stat Quick Consensus Table")
-    st.caption("Standard lines evaluated simultaneously across all 7 statistics for this matchup.")
+    st.caption("Common lines evaluated simultaneously across all 7 statistics.")
 
     summary_rows = []
     for stat in TARGETS:
@@ -563,10 +533,9 @@ def main():
             }
         )
 
-    summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-    # ── Section 5: Natural Language Question Box ───────────────────────────────
+    # ── Section 5: Ask a Question Box ─────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 💬 Ask a Question About This Matchup")
     user_q = st.text_input(
@@ -590,9 +559,8 @@ def main():
                     + f"- **Forecast Context:** Expected playing time is **{pred_min:.1f} minutes** ({role_label}). LightGBM median is **{pred_stats[q_stat]:.1f} {q_stat}**."
                 )
         else:
-            st.warning("Could not identify both a target stat (e.g. points, assists) and a threshold number in your question. Try e.g. 'Will he score over 20.5 points?'")
+            st.warning("Could not identify both a target stat (e.g. points, assists) and a threshold number. Try: 'Will he score over 20.5 points?'")
 
 
 if __name__ == "__main__":
     main()
-

@@ -18,27 +18,41 @@ from data.loader import get_player_logs
 
 logger = logging.getLogger(__name__)
 
+# In-memory daily schedule cache: {date_str: (timestamp, games_list)}
+_SCHEDULE_CACHE: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+CACHE_TTL_SECONDS = 300  # 5 minutes
 
-def get_daily_schedule(game_date: Optional[str | datetime.date] = None) -> List[Dict[str, Any]]:
+
+def _normalize_date_str(date_val: Optional[str | datetime.date]) -> str:
+    """Normalize any date input (including DD/MM/YY or DD/MM/YYYY) to 'YYYY-MM-DD'."""
+    if date_val is None:
+        return datetime.date.today().strftime("%Y-%m-%d")
+    if isinstance(date_val, datetime.date):
+        return date_val.strftime("%Y-%m-%d")
+
+    s = str(date_val).strip()
+    try:
+        # Supports DD/MM/YY, DD/MM/YYYY, YYYY-MM-DD, etc.
+        dt = pd.to_datetime(s, dayfirst=True)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        # Fallback to direct string
+        return s
+
+
+def get_daily_schedule(game_date: Optional[str | datetime.date] = None, force_reload: bool = False) -> List[Dict[str, Any]]:
     """
     Fetch the official NBA schedule for a specific date using nba_api.
-
-    Parameters
-    ----------
-    game_date : 'YYYY-MM-DD' or datetime.date. Defaults to today's date.
-
-    Returns
-    -------
-    List of game dicts with keys:
-        game_id, game_date, home_team_id, home_team_abbrev, home_team_name,
-        away_team_id, away_team_abbrev, away_team_name, game_status, label
+    Supports flexible date parsing (e.g. '16/11/26', '2026-11-16', datetime.date).
     """
-    if game_date is None:
-        target_str = datetime.date.today().strftime("%Y-%m-%d")
-    elif isinstance(game_date, datetime.date):
-        target_str = game_date.strftime("%Y-%m-%d")
-    else:
-        target_str = str(game_date).strip()
+    target_str = _normalize_date_str(game_date)
+    now_ts = datetime.datetime.now().timestamp()
+
+    # Check in-memory cache
+    if not force_reload and target_str in _SCHEDULE_CACHE:
+        cached_ts, cached_games = _SCHEDULE_CACHE[target_str]
+        if now_ts - cached_ts < CACHE_TTL_SECONDS:
+            return cached_games
 
     try:
         sb = scoreboardv2.ScoreboardV2(game_date=target_str)
@@ -51,6 +65,7 @@ def get_daily_schedule(game_date: Optional[str | datetime.date] = None) -> List[
     if gh.empty or ls.empty:
         return []
 
+    gh = gh.drop_duplicates(subset=["GAME_ID"])
     scheduled_games: List[Dict[str, Any]] = []
 
     for _, row in gh.iterrows():
@@ -69,31 +84,36 @@ def get_daily_schedule(game_date: Optional[str | datetime.date] = None) -> List[
             a_abbrev = str(a_row.iloc[0]["TEAM_ABBREVIATION"])
             a_name = str(a_row.iloc[0].get("TEAM_NAME", a_abbrev))
 
-            label = f"{a_abbrev} @ {h_abbrev} ({status})"
+            label = f"{a_name} ({a_abbrev}) @ {h_name} ({h_abbrev}) — {status}"
 
             scheduled_games.append({
                 "game_id": gid,
                 "game_date": target_str,
                 "home_team_id": h_id,
                 "home_team_abbrev": h_abbrev,
+                "home_abbrev": h_abbrev,
                 "home_team_name": h_name,
+                "home_name": h_name,
                 "away_team_id": a_id,
                 "away_team_abbrev": a_abbrev,
+                "away_abbrev": a_abbrev,
                 "away_team_name": a_name,
+                "away_name": a_name,
                 "game_status": status,
                 "label": label,
             })
 
+    _SCHEDULE_CACHE[target_str] = (now_ts, scheduled_games)
     return scheduled_games
 
 
 def get_team_recent_rotation(
     team_abbrev: str,
-    max_days_lookback: int = 30,
-    min_games: int = 2,
+    max_days_lookback: int = 45,
+    min_games: int = 1,
 ) -> List[Dict[str, Any]]:
     """
-    Get active rotation players for a team based on their most recent historical appearances.
+    Get active rotation players for a team based on their most recent appearances.
     Returns players sorted descending by average minutes played (starters first).
     """
     clean_p = get_player_logs()
@@ -106,7 +126,7 @@ def get_team_recent_rotation(
     recent = team_logs[team_logs["GAME_DATE"] >= cutoff_date]
 
     if recent.empty:
-        recent = team_logs.tail(100)
+        recent = team_logs.tail(150)
 
     stats = (
         recent.groupby(["PLAYER_ID", "PLAYER_NAME"])
@@ -125,7 +145,9 @@ def get_team_recent_rotation(
         rotation.append({
             "player_id": int(r["PLAYER_ID"]),
             "player_name": str(r["PLAYER_NAME"]),
+            "name": str(r["PLAYER_NAME"]),
             "avg_minutes": round(float(r["avg_minutes"]), 1),
+            "avg_min": round(float(r["avg_minutes"]), 1),
             "avg_pts": round(float(r["avg_pts"]), 1),
             "games_played": int(r["games_played"]),
             "display": f"{r['PLAYER_NAME']} ({r['avg_minutes']:.1f} mpg, {r['avg_pts']:.1f} ppg)",
