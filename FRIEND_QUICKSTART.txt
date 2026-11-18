@@ -1,0 +1,35 @@
+NBA Player Performance & Probability Engine (v1) — Friend Setup Guide
+=======================================================================
+
+1. Create a Python virtual environment (Python 3.10+ recommended) and install packages:
+   python -m venv .venv
+   # Windows:
+   .venv\Scripts\activate
+   # macOS/Linux:
+   # source .venv/bin/activate
+   pip install -r requirements.txt
+
+2. (Optional) Copy .env.example to .env if needed (local defaults work without .env).
+
+3. Run a player performance & threshold probability query right away:
+   python scripts/query_player.py --player "LeBron James" --opponent GSW --away --date 2026-11-01 --line PTS:20.5,25.0,25.5 --line AST:6.5
+
+4. Or call from Python:
+   from models.inference import PlayerProbabilityEngine
+   engine = PlayerProbabilityEngine()
+   res = engine.predict_player(
+       player="Stephen Curry",
+       opponent="LAL",
+       is_home=1,
+       lines_by_stat={"PTS": [20.5, 25.5, 30.5], "3PM": [3.5, 4.5]},
+   )
+
+5. Verify the installation with the automated test suite (54 tests):
+   pytest tests/ -v
+
+6. Key Reports:
+   - PROBABILITY_ENGINE_FINAL_REPORT.md
+   - PROBABILITY_RESIDUAL_ANALYSIS_REPORT.md
+   - MINUTES_MODEL_AND_RETRAINING_SHOWDOWN_REPORT.md
+   - MODEL_EVALUATION_AND_ALGORITHM_SHOWDOWN_REPORT.md
+   - DATA_DICTIONARY.md
