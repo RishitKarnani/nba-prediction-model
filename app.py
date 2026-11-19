@@ -30,6 +30,7 @@ from data.schedule import get_daily_schedule, get_team_recent_rotation
 from models.inference import PlayerProbabilityEngine
 from models.probability import LineProbabilityResult, OutcomeDistribution
 from models.residuals import TARGETS, canonical_stat_name
+from models.team_inference import TeamPredictionEngine
 
 # ── Streamlit Page Configuration ─────────────────────────────────────────────
 st.set_page_config(
@@ -118,6 +119,11 @@ st.markdown(
 @st.cache_resource(show_spinner="Loading Probability Engine & Champion Models...")
 def get_cached_engine() -> PlayerProbabilityEngine:
     return PlayerProbabilityEngine()
+
+
+@st.cache_resource(show_spinner="Loading Team Prediction Engine...")
+def get_cached_team_engine() -> TeamPredictionEngine:
+    return TeamPredictionEngine(apply_form=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -308,6 +314,54 @@ def main():
         """,
         unsafe_allow_html=True,
     )
+
+    # ── Team Model: Win Probability & Margin of Win ───────────────────────────
+    try:
+        team_engine = get_cached_team_engine()
+        team_pred_res = team_engine.predict_game(
+            home_team=home_team_abbrev,
+            away_team=away_team_abbrev,
+            n_simulations=10,
+        )
+        tp = team_pred_res["prediction"]
+        winner_name = tp["predicted_winner"]
+        winner_abbr = tp["winner_abbreviation"]
+        h_prob = tp["home_win_probability"]
+        a_prob = tp["away_win_probability"]
+        pred_margin = tp["predicted_margin"]
+        pred_spread = tp["implied_spread"]
+        score_h = tp["predicted_score"].get(home_team_abbrev, 0.0)
+        score_a = tp["predicted_score"].get(away_team_abbrev, 0.0)
+
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border: 1px solid #334155; border-radius: 12px; padding: 18px 22px; margin-bottom: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px;">
+                    <div>
+                        <div style="font-size: 0.75rem; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; font-weight: 700;">🏆 TEAM WIN PREDICTION</div>
+                        <div style="font-size: 1.35rem; font-weight: 800; color: #38bdf8; margin-top: 2px;">
+                            {winner_name} ({winner_abbr})
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-size: 0.75rem; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; font-weight: 700;">MARGIN OF WIN</div>
+                        <div style="font-size: 1.35rem; font-weight: 800; color: #4ade80; margin-top: 2px;">
+                            {pred_margin} <span style="font-size: 0.95rem; color: #cbd5e1; font-weight: 600;">({pred_spread})</span>
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-size: 0.88rem; font-weight: 600; color: #e2e8f0; margin-bottom: 6px;">
+                    <span>✈️ {away_team_abbrev}: <b>{a_prob*100:.1f}%</b> ({score_a:.1f} pts)</span>
+                    <span>🏠 {home_team_abbrev}: <b>{h_prob*100:.1f}%</b> ({score_h:.1f} pts)</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.progress(h_prob, text=f"Win Probability: {away_team_abbrev} {a_prob*100:.1f}% | {home_team_abbrev} {h_prob*100:.1f}%")
+        st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
+    except Exception as e:
+        st.caption(f"Team outcome model note: {e}")
 
     # Top KPI Row
     kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
