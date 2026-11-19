@@ -26,7 +26,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from data.loader import get_common_players, get_player_logs, get_team_logs
-from data.schedule import get_daily_schedule, get_team_recent_rotation
+from data.schedule import _normalize_date_str, get_daily_schedule, get_team_recent_rotation
 from models.inference import PlayerProbabilityEngine
 from models.probability import LineProbabilityResult, OutcomeDistribution
 from models.residuals import TARGETS, canonical_stat_name
@@ -177,13 +177,15 @@ def main():
     st.caption("Live 2-Day Upcoming Matchup Predictions & Threshold Probability Estimator")
 
     # ── Sidebar: 2-Day Matchup Selection Workflow ─────────────────────────────
-    st.sidebar.header("📅 Select Upcoming Matchup")
+    st.sidebar.header("📅 Select Matchup")
 
     today_dt = datetime.date.today()
+    yesterday_dt = today_dt - datetime.timedelta(days=1)
     tomorrow_dt = today_dt + datetime.timedelta(days=1)
 
-    # 2-Day Slate Selector
+    # 3-Day Slate Selector (Yesterday, Today, Tomorrow)
     day_options = {
+        f"Yesterday ({yesterday_dt.strftime('%b %d')})": yesterday_dt,
         f"Today ({today_dt.strftime('%b %d')})": today_dt,
         f"Tomorrow ({tomorrow_dt.strftime('%b %d')})": tomorrow_dt,
     }
@@ -191,19 +193,20 @@ def main():
     selected_day_label = st.sidebar.radio(
         "Matchup Slate",
         options=list(day_options.keys()),
-        index=0,
+        index=1,
     )
     target_date = day_options[selected_day_label]
 
     # Optional Custom Date expander if user ever needs to check another date
     with st.sidebar.expander("🔍 Or check another date"):
-        custom_input = st.text_input("Enter date (e.g. 16/11/26 or 2026-11-16)", placeholder="DD/MM/YY")
+        custom_input = st.text_input("Enter date (e.g. 19th nov, 19/11/26, 2026-11-19)", placeholder="e.g. 19th nov")
         if custom_input.strip():
             try:
-                target_date = pd.to_datetime(custom_input.strip(), dayfirst=True).date()
+                norm_str = _normalize_date_str(custom_input.strip())
+                target_date = datetime.date.fromisoformat(norm_str)
                 st.sidebar.caption(f"Showing games for: **{target_date.strftime('%a, %b %d, %Y')}**")
             except Exception:
-                st.sidebar.error("Invalid date format. Use DD/MM/YY or YYYY-MM-DD.")
+                st.sidebar.error("Invalid date format. Use '19th nov', DD/MM/YY, or YYYY-MM-DD.")
 
     # Fetch official NBA schedule for the chosen date
     date_str = target_date.strftime("%Y-%m-%d")

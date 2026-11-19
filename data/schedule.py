@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import datetime
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from dateutil import parser
 from nba_api.stats.endpoints import scoreboardv2
 
 from data.loader import get_player_logs
@@ -24,19 +26,38 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
 def _normalize_date_str(date_val: Optional[str | datetime.date]) -> str:
-    """Normalize any date input (including DD/MM/YY or DD/MM/YYYY) to 'YYYY-MM-DD'."""
+    """Normalize any date input (including DD/MM/YY, '19th nov', 'yesterday', or YYYY-MM-DD) to 'YYYY-MM-DD'."""
     if date_val is None:
         return datetime.date.today().strftime("%Y-%m-%d")
     if isinstance(date_val, datetime.date):
         return date_val.strftime("%Y-%m-%d")
 
     s = str(date_val).strip()
+    s_lower = s.lower()
+    today = datetime.date.today()
+
+    if s_lower == "yesterday":
+        return (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    if s_lower == "today":
+        return today.strftime("%Y-%m-%d")
+    if s_lower == "tomorrow":
+        return (today + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Clean ordinals like 19th -> 19
+    clean = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s, flags=re.IGNORECASE)
+
     try:
-        # Supports DD/MM/YY, DD/MM/YYYY, YYYY-MM-DD, etc.
-        dt = pd.to_datetime(s, dayfirst=True)
+        # Default to current year if no year provided in input (e.g. '19th nov')
+        default_dt = datetime.datetime.now()
+        dt = parser.parse(clean, default=default_dt, dayfirst=True)
         return dt.strftime("%Y-%m-%d")
     except Exception:
-        # Fallback to direct string
+        pass
+
+    try:
+        dt = pd.to_datetime(clean, dayfirst=True)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
         return s
 
 
