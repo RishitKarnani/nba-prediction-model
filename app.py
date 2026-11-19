@@ -127,12 +127,20 @@ def get_cached_team_engine() -> TeamPredictionEngine:
 
 
 @st.cache_data(show_spinner=False)
-def get_final_matchup_prediction(home_team_abbrev: str, away_team_abbrev: str) -> Dict[str, Any]:
-    """Fetch the final pre-computed simulation result for this exact matchup."""
+def get_final_matchup_prediction(
+    home_team_abbrev: str,
+    away_team_abbrev: str,
+    injuries_home: tuple = (),
+    injuries_away: tuple = (),
+) -> Dict[str, Any]:
+    """Fetch the 500-simulation average result for this exact matchup with injuries factored in."""
     team_engine = get_cached_team_engine()
     return team_engine.predict_game(
         home_team=home_team_abbrev,
         away_team=away_team_abbrev,
+        n_simulations=500,
+        injuries_home=list(injuries_home),
+        injuries_away=list(injuries_away),
     )
 
 
@@ -283,6 +291,16 @@ def main():
             team_players = sorted(p_logs["PLAYER_NAME"].unique().tolist())
         selected_player = st.sidebar.selectbox(f"Select Player ({focus_team})", options=team_players, index=0)
 
+    # ── Step 4: Injury Report (Optional) ──────────────────────────────────────
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🏥 Injury Report (Mark Players OUT)", expanded=False):
+        st.caption("Enter comma-separated names of players who are OUT. The engine will automatically redistribute their minutes and adjust team offensive ratings.")
+        inj_away_raw = st.text_input(f"❌ {away_team_abbrev} OUT Players", placeholder="e.g. Anthony Edwards", key="inj_away")
+        inj_home_raw = st.text_input(f"❌ {home_team_abbrev} OUT Players", placeholder="e.g. Giannis Antetokounmpo", key="inj_home")
+
+    injuries_away = tuple([p.strip() for p in inj_away_raw.split(",") if p.strip()])
+    injuries_home = tuple([p.strip() for p in inj_home_raw.split(",") if p.strip()])
+
     # Simulation Settings in Sidebar Expander
     with st.sidebar.expander("⚙️ Simulation Settings"):
         n_sims = st.slider("Monte Carlo Draws", min_value=2000, max_value=20000, value=10000, step=2000)
@@ -334,6 +352,8 @@ def main():
         team_pred_res = get_final_matchup_prediction(
             home_team_abbrev=home_team_abbrev,
             away_team_abbrev=away_team_abbrev,
+            injuries_home=injuries_home,
+            injuries_away=injuries_away,
         )
         tp = team_pred_res["prediction"]
         winner_name = tp["predicted_winner"]
@@ -371,6 +391,15 @@ def main():
             h_prob,
             text=f"Win Probability: {away_team_abbrev} {a_prob*100:.1f}%  vs  {home_team_abbrev} {h_prob*100:.1f}%",
         )
+
+        # Show injury alert badges if injuries are active
+        all_injuries = list(injuries_away) + list(injuries_home)
+        if all_injuries:
+            st.caption(f"🏥 **Injury adjustments factored in:** {', '.join(all_injuries)} marked OUT (minutes & points redistributed)")
+
+        # Alert if the currently inspected player is injured
+        if any(selected_player.lower() in inj.lower() or inj.lower() in selected_player.lower() for inj in all_injuries):
+            st.warning(f"⚠️ **{selected_player}** is listed as **OUT** in the Injury Report for this game.")
     except Exception as e:
         st.warning(f"Team outcome model could not be loaded: {e}")
 

@@ -180,9 +180,14 @@ def simulate_game(
         for i in range(5) for j in range(5)
     )
 
-    # 3. Offensive Ratings
+    # 3. Opponent Defensive Impact & Net Offensive Ratings
+    league_drtg = 112.0
+    def_impact_home = (away_baselines.get("base_drtg", league_drtg) - league_drtg) * 0.75
+    def_impact_away = (home_baselines.get("base_drtg", league_drtg) - league_drtg) * 0.75
+
     ortg_home = (
         home_baselines["base_ortg"]
+        + def_impact_home
         + home_lineup_adj
         + delta_h_off
         + (hca_points / 2.0)
@@ -190,6 +195,7 @@ def simulate_game(
     )
     ortg_away = (
         away_baselines["base_ortg"]
+        + def_impact_away
         + away_lineup_adj
         + delta_a_off
         - (hca_points / 2.0)
