@@ -19,6 +19,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from data.loader import resolve_team_id
 from src.matchup_simulator import (
     SIMULATION_RESULTS_PATH,
@@ -130,6 +132,8 @@ class TeamPredictionEngine:
         if home_abbrev == away_abbrev:
             raise ValueError("Home and Away teams cannot be the same.")
 
+        fixture_key = f"{away_abbrev}_at_{home_abbrev}"
+
         # ── Injury processing ─────────────────────────────────────────────────
         injuries_home = injuries_home or []
         injuries_away = injuries_away or []
@@ -147,7 +151,69 @@ class TeamPredictionEngine:
         if injuries_away:
             a_lineup_raw, a_injury_ortg_adj, a_injury_summary = apply_injuries(a_lineup_raw, injuries_away)
 
-        # ── Lineup impact (tactical quality score) ────────────────────────────
+        # ── Fast path: Official Pre-computed Final Simulation Results ─────────
+        # When no injuries are specified, return the definitive 8,700-game final simulation result
+        if not injuries_home and not injuries_away and self.sim_results and "matchups" in self.sim_results:
+            cached = self.sim_results["matchups"].get(fixture_key)
+            if cached:
+                h_name = cached["home_team_name"]
+                a_name = cached["away_team_name"]
+                pred_winner = cached["predicted_winner"]
+                winner_name = h_name if pred_winner == home_abbrev else a_name
+                raw_margin = float(cached["predicted_margin"])
+                margin_val = abs(raw_margin)
+                margin_str = f"+{margin_val:.1f} ({pred_winner})"
+
+                return {
+                    "fixture": fixture_key,
+                    "home_team": home_abbrev,
+                    "away_team": away_abbrev,
+                    "home_team_name": h_name,
+                    "away_team_name": a_name,
+                    "form_applied": self.apply_form,
+                    "form": {
+                        home_abbrev: self.form_data.get(home_abbrev, {}),
+                        away_abbrev: self.form_data.get(away_abbrev, {}),
+                    },
+                    "injuries": {
+                        home_abbrev: h_injury_summary,
+                        away_abbrev: a_injury_summary,
+                    },
+                    "prediction": {
+                        "predicted_winner": winner_name,
+                        "winner_abbreviation": pred_winner,
+                        "home_win_probability": cached["home_win_probability"],
+                        "away_win_probability": cached["away_win_probability"],
+                        "predicted_score": {
+                            home_abbrev: cached["predicted_home_pts"],
+                            away_abbrev: cached["predicted_away_pts"],
+                        },
+                        "predicted_margin": margin_str,
+                        "implied_spread": f"{pred_winner} -{margin_val:.1f}",
+                    },
+                    "tactical_gameplan": {
+                        "home_team": {
+                            "team": h_name,
+                            "best_offensive_action": cached["home_tactical_gameplan"]["best_offensive_action"],
+                            "best_defensive_action": cached["home_tactical_gameplan"]["best_defensive_action"],
+                            "adjusted_offensive_weights": cached["home_tactical_gameplan"]["adjusted_offensive_weights"],
+                            "adjusted_defensive_weights": cached["home_tactical_gameplan"]["adjusted_defensive_weights"],
+                        },
+                        "away_team": {
+                            "team": a_name,
+                            "best_offensive_action": cached["away_tactical_gameplan"]["best_offensive_action"],
+                            "best_defensive_action": cached["away_tactical_gameplan"]["best_defensive_action"],
+                            "adjusted_offensive_weights": cached["away_tactical_gameplan"]["adjusted_offensive_weights"],
+                            "adjusted_defensive_weights": cached["away_tactical_gameplan"]["adjusted_defensive_weights"],
+                        },
+                    },
+                    "lineup_predicted_minutes": {
+                        "home_team": h_lineup_raw[:8],
+                        "away_team": a_lineup_raw[:8],
+                    },
+                }
+
+        # ── Dynamic Simulation (with deterministic seed) ─────────────────────
         h_lineup_adj = calculate_lineup_impact(h_lineup_raw)
         a_lineup_adj = calculate_lineup_impact(a_lineup_raw)
 
@@ -180,7 +246,10 @@ class TeamPredictionEngine:
             a_off_wins, a_def_wins, a_tactics["offensive_actions"], a_tactics["defensive_actions"]
         )
 
-        # ── Monte Carlo simulation ────────────────────────────────────────────
+        # ── Monte Carlo simulation (deterministic per fixture) ───────────────
+        seed_val = abs(hash(fixture_key)) % (2**31)
+        np.random.seed(seed_val)
+
         home_wins = 0
         home_pts_list = []
         away_pts_list = []

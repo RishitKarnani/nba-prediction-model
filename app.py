@@ -126,6 +126,16 @@ def get_cached_team_engine() -> TeamPredictionEngine:
     return TeamPredictionEngine(apply_form=True)
 
 
+@st.cache_data(show_spinner=False)
+def get_final_matchup_prediction(home_team_abbrev: str, away_team_abbrev: str) -> Dict[str, Any]:
+    """Fetch the final pre-computed simulation result for this exact matchup."""
+    team_engine = get_cached_team_engine()
+    return team_engine.predict_game(
+        home_team=home_team_abbrev,
+        away_team=away_team_abbrev,
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_schedule_for_date(date_str: str) -> List[Dict]:
     return get_daily_schedule(date_str)
@@ -318,11 +328,9 @@ def main():
     # ── Section: Team Win Probability & Margin of Win ─────────────────────────
     st.markdown("### 🏆 Team Win Probability & Projected Margin")
     try:
-        team_engine = get_cached_team_engine()
-        team_pred_res = team_engine.predict_game(
-            home_team=home_team_abbrev,
-            away_team=away_team_abbrev,
-            n_simulations=50,
+        team_pred_res = get_final_matchup_prediction(
+            home_team_abbrev=home_team_abbrev,
+            away_team_abbrev=away_team_abbrev,
         )
         tp = team_pred_res["prediction"]
         winner_name = tp["predicted_winner"]
