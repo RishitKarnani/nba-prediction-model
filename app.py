@@ -315,13 +315,14 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ── Team Model: Win Probability & Margin of Win ───────────────────────────
+    # ── Section: Team Win Probability & Margin of Win ─────────────────────────
+    st.markdown("### 🏆 Team Win Probability & Projected Margin")
     try:
         team_engine = get_cached_team_engine()
         team_pred_res = team_engine.predict_game(
             home_team=home_team_abbrev,
             away_team=away_team_abbrev,
-            n_simulations=10,
+            n_simulations=50,
         )
         tp = team_pred_res["prediction"]
         winner_name = tp["predicted_winner"]
@@ -333,35 +334,36 @@ def main():
         score_h = tp["predicted_score"].get(home_team_abbrev, 0.0)
         score_a = tp["predicted_score"].get(away_team_abbrev, 0.0)
 
-        st.markdown(
-            f"""
-            <div style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border: 1px solid #334155; border-radius: 12px; padding: 18px 22px; margin-bottom: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px;">
-                    <div>
-                        <div style="font-size: 0.75rem; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; font-weight: 700;">🏆 TEAM WIN PREDICTION</div>
-                        <div style="font-size: 1.35rem; font-weight: 800; color: #38bdf8; margin-top: 2px;">
-                            {winner_name} ({winner_abbr})
-                        </div>
-                    </div>
-                    <div style="text-align: right;">
-                        <div style="font-size: 0.75rem; letter-spacing: 1.5px; text-transform: uppercase; color: #94a3b8; font-weight: 700;">MARGIN OF WIN</div>
-                        <div style="font-size: 1.35rem; font-weight: 800; color: #4ade80; margin-top: 2px;">
-                            {pred_margin} <span style="font-size: 0.95rem; color: #cbd5e1; font-weight: 600;">({pred_spread})</span>
-                        </div>
-                    </div>
-                </div>
-                <div style="display: flex; justify-content: space-between; font-size: 0.88rem; font-weight: 600; color: #e2e8f0; margin-bottom: 6px;">
-                    <span>✈️ {away_team_abbrev}: <b>{a_prob*100:.1f}%</b> ({score_a:.1f} pts)</span>
-                    <span>🏠 {home_team_abbrev}: <b>{h_prob*100:.1f}%</b> ({score_h:.1f} pts)</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        t_col1, t_col2, t_col3 = st.columns([2, 2, 2])
+        with t_col1:
+            st.metric(
+                label=f"✈️ {away_team_name} ({away_team_abbrev})",
+                value=f"{a_prob*100:.1f}% Win Prob",
+                delta=f"Proj: {score_a:.1f} PTS",
+                delta_color="normal" if a_prob >= 0.5 else "off",
+            )
+        with t_col2:
+            st.metric(
+                label="Predicted Winner & Margin",
+                value=f"{winner_abbr} {pred_margin}",
+                delta=f"Winner: {winner_name} ({pred_spread})",
+            )
+        with t_col3:
+            st.metric(
+                label=f"🏠 {home_team_name} ({home_team_abbrev})",
+                value=f"{h_prob*100:.1f}% Win Prob",
+                delta=f"Proj: {score_h:.1f} PTS",
+                delta_color="normal" if h_prob >= 0.5 else "off",
+            )
+
+        st.progress(
+            h_prob,
+            text=f"Win Probability: {away_team_abbrev} {a_prob*100:.1f}%  vs  {home_team_abbrev} {h_prob*100:.1f}%",
         )
-        st.progress(h_prob, text=f"Win Probability: {away_team_abbrev} {a_prob*100:.1f}% | {home_team_abbrev} {h_prob*100:.1f}%")
-        st.markdown("<div style='margin-bottom: 20px;'></div>", unsafe_allow_html=True)
     except Exception as e:
-        st.caption(f"Team outcome model note: {e}")
+        st.warning(f"Team outcome model could not be loaded: {e}")
+
+    st.markdown("---")
 
     # Top KPI Row
     kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
